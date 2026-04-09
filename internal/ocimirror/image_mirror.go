@@ -6,13 +6,14 @@ package ocimirror
 import (
 	"context"
 	"fmt"
-	"slices"
-	"strings"
+	"sort"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -104,11 +105,12 @@ func (m *ImageMirror) BuildImageTransformations(manifests string) []ImageTransfo
 	return transforms
 }
 
-// ReplicateOCIArtifacts triggers replication for new OCI artifacts found in renderedManifests, skipping alreadyReplicated ones.
+// ReplicateOCIArtifacts triggers replication for OCI artifacts found in renderedManifests.
+// The returned list is scoped to the current manifest - stale refs from prior chart versions are pruned.
 func (m *ImageMirror) ReplicateOCIArtifacts(ctx context.Context, renderedManifests string, alreadyReplicated []string) ([]string, error) {
 	imageRefs := ExtractUniqueOCIRefs(renderedManifests)
 	if len(imageRefs) == 0 {
-		return alreadyReplicated, nil
+		return nil, nil
 	}
 
 	alreadySet := make(map[string]struct{}, len(alreadyReplicated))
@@ -116,17 +118,17 @@ func (m *ImageMirror) ReplicateOCIArtifacts(ctx context.Context, renderedManifes
 		alreadySet[img] = struct{}{}
 	}
 
-	replicated := slices.Clone(alreadyReplicated)
-
-	var replicationErrors []string
+	var replicated []string
+	var replicationErrors []error
 	for _, imageRef := range imageRefs {
 		if _, ok := alreadySet[imageRef]; ok {
+			replicated = append(replicated, imageRef)
 			continue
 		}
 
 		replicatedRef, _, err := m.EnsureReplicated(ctx, imageRef)
 		if err != nil {
-			replicationErrors = append(replicationErrors, fmt.Sprintf("%s: %v", imageRef, err))
+			replicationErrors = append(replicationErrors, fmt.Errorf("%s: %w", imageRef, err))
 			continue
 		}
 		if replicatedRef == "" {
@@ -136,11 +138,9 @@ func (m *ImageMirror) ReplicateOCIArtifacts(ctx context.Context, renderedManifes
 		replicated = append(replicated, imageRef)
 	}
 
-	if len(replicationErrors) > 0 {
-		return replicated, fmt.Errorf("failed to replicate images: %s", strings.Join(replicationErrors, "; "))
-	}
+	sort.Strings(replicated)
 
-	return replicated, nil
+	return replicated, utilerrors.NewAggregate(replicationErrors)
 }
 
 // buildMirroredOCIRef resolves imageRef against the mirror config and returns the mirrored reference.
@@ -161,7 +161,10 @@ func (m *ImageMirror) buildMirroredOCIRef(imageRef string) string {
 // triggerReplication fetches the manifest for the given ref to warm the pull-through cache.
 func (m *ImageMirror) triggerReplication(ctx context.Context, ref string, extraOpts ...crane.Option) ([]byte, error) {
 	log.FromContext(ctx).V(1).Info("triggering replication", "ref", ref)
-	opts := append([]crane.Option{crane.WithAuth(m.auth)}, extraOpts...)
+	opts := append([]crane.Option{
+		crane.WithAuth(m.auth),
+		crane.WithPlatform(&v1.Platform{OS: "linux", Architecture: "amd64"}),
+	}, extraOpts...)
 	manifest, err := m.manifestFetcher(ref, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch manifest for %s: %w", ref, err)

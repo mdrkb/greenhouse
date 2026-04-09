@@ -78,6 +78,18 @@ var _ = Describe("EnsureReplicated", func() {
 		Expect(fetchCount).To(Equal(0))
 	})
 
+	It("should pass platform option to manifest fetcher", func() {
+		var receivedOpts []crane.Option
+		mirror := newTestImageMirror(mirrorConfig, func(ref string, opts ...crane.Option) ([]byte, error) {
+			receivedOpts = opts
+			return []byte(`{}`), nil
+		})
+
+		_, _, err := mirror.EnsureReplicated(context.Background(), "ghcr.io/cloudoperators/greenhouse:main")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(receivedOpts)).To(BeNumerically(">=", 2))
+	})
+
 	It("should propagate replication errors", func() {
 		mirror := newTestImageMirror(mirrorConfig, func(ref string, opts ...crane.Option) ([]byte, error) {
 			return nil, errors.New("connection refused")
@@ -224,7 +236,7 @@ containers:
 		Expect(replicated).NotTo(ContainElement("ghcr.io/cloudoperators/greenhouse:main"))
 	})
 
-	It("should return existing list when no images in manifests", func() {
+	It("should return nil when no images in manifests", func() {
 		mirror := newTestImageMirror(mirrorConfig, func(ref string, opts ...crane.Option) ([]byte, error) {
 			return []byte("{}"), nil
 		})
@@ -233,10 +245,9 @@ containers:
 apiVersion: v1
 kind: ConfigMap
 `
-		existing := []string{"some-image:latest"}
-		replicated, err := mirror.ReplicateOCIArtifacts(context.Background(), manifests, existing)
+		replicated, err := mirror.ReplicateOCIArtifacts(context.Background(), manifests, []string{"some-image:latest"})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(replicated).To(Equal(existing))
+		Expect(replicated).To(BeNil())
 	})
 })
 
