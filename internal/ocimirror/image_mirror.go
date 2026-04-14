@@ -61,24 +61,41 @@ func NewImageMirrorForTest(config *RegistryMirrorConfig, auth authn.Authenticato
 	}
 }
 
-// EnsureReplicated warms the pull-through cache for an OCI artifact.
-func (m *ImageMirror) EnsureReplicated(ctx context.Context, ociRef string) (replicatedRef string, manifest []byte, err error) {
-	// Upstream registry. Rewrite to mirror.
+// EnsureChartReplicated warms the pull-through cache for a chart on a mirror domain.
+func (m *ImageMirror) EnsureChartReplicated(ctx context.Context, ociRef string) (replicatedRef string, manifest []byte, err error) {
+	replicationRef, returnRef := m.buildReplicationRef(ociRef)
+	if replicationRef == "" {
+		return "", nil, nil
+	}
+	manifest, err = m.triggerReplication(ctx, replicationRef)
+	return returnRef, manifest, err
+}
+
+// EnsureImageReplicated warms the pull-through cache for a container image, including upstream refs.
+func (m *ImageMirror) EnsureImageReplicated(ctx context.Context, ociRef string) (replicatedRef string, manifest []byte, err error) {
 	if mirroredRef := m.buildMirroredOCIRef(ociRef); mirroredRef != "" {
-		manifest, err := m.triggerReplication(ctx, mirroredRef)
+		manifest, err = m.triggerReplication(ctx, mirroredRef)
 		return mirroredRef, manifest, err
 	}
+	return m.EnsureChartReplicated(ctx, ociRef)
+}
 
-	// Already on a mirror. Replicate directly.
-	registry, _, _ := SplitOCIRef(ociRef)
+// buildReplicationRef resolves an OCI ref on a mirror domain to the primaryMirror ref for replication.
+func (m *ImageMirror) buildReplicationRef(ociRef string) (replicationRef, returnRef string) {
+	registry, repo, tagOrDigest := SplitOCIRef(ociRef)
+
+	if registry == m.config.PrimaryMirror {
+		return ociRef, ociRef
+	}
+
 	for _, mirror := range m.config.RegistryMirrors {
 		if mirror.BaseDomain == registry {
-			manifest, err := m.triggerReplication(ctx, ociRef)
-			return ociRef, manifest, err
+			primaryRef := fmt.Sprintf("%s/%s", m.config.PrimaryMirror, repo) + tagOrDigest
+			return primaryRef, ociRef
 		}
 	}
 
-	return "", nil, nil
+	return "", ""
 }
 
 // BuildImageTransformations extracts image refs from the given rendered manifest
@@ -143,7 +160,7 @@ func (m *ImageMirror) ReplicateOCIArtifacts(ctx context.Context, alreadyReplicat
 			continue
 		}
 
-		replicatedRef, _, err := m.EnsureReplicated(ctx, imageRef)
+		replicatedRef, _, err := m.EnsureImageReplicated(ctx, imageRef)
 		if err != nil {
 			replicationErrors = append(replicationErrors, fmt.Errorf("%s: %w", imageRef, err))
 			continue
@@ -167,7 +184,7 @@ func (m *ImageMirror) buildMirroredOCIRef(imageRef string) string {
 		return ""
 	}
 
-	mirroredRef := fmt.Sprintf("%s/%s/%s", resolved.Mirror.BaseDomain, resolved.Mirror.SubPath, resolved.Repository)
+	mirroredRef := fmt.Sprintf("%s/%s/%s", m.config.PrimaryMirror, resolved.Mirror.SubPath, resolved.Repository)
 	if resolved.TagOrDigest != "" {
 		mirroredRef += resolved.TagOrDigest
 	}
